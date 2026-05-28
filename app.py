@@ -1,121 +1,282 @@
-import streamlit as st
-import shutil
 import os
-import git
+import tempfile
+import streamlit as st
 
 from dotenv import load_dotenv
 
-from langchain_core.documents import Document
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_community.vectorstores import Chroma
-from langchain.chains import ConversationalRetrievalChain
+from langchain_chroma import Chroma
 from langchain_groq import ChatGroq
+from langchain_huggingface import HuggingFaceEmbeddings
+
+from langchain_core.chat_history import BaseChatMessageHistory
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.runnables.history import RunnableWithMessageHistory
+
+from langchain_community.chat_message_histories import ChatMessageHistory
+from langchain_community.document_loaders import PyPDFLoader
+
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+from langchain_classic.chains import (
+create_history_aware_retriever,
+create_retrieval_chain
+)
+
+from langchain_classic.chains.combine_documents import (
+create_stuff_documents_chain
+)
+
+# =========================
+
+# LOAD ENV VARIABLES
+
+# =========================
 
 load_dotenv()
 
-SUPPORTED_EXTENSIONS = ['.py', '.js', '.ts', '.java', '.cpp', '.c', '.md', '.txt']
+# =========================
 
-def clone_repo(repo_url: str, clone_path: str = "./cloned_repo"):
-    if os.path.exists(clone_path):
-        return clone_path
-    git.Repo.clone_from(repo_url, clone_path)
-    return clone_path
+# PAGE CONFIG
 
-def load_code_files(repo_path: str):
-    docs = []
-    for root, dirs, files in os.walk(repo_path):
-        dirs[:] = [d for d in dirs if not d.startswith('.')]
-        for file in files:
-            ext = os.path.splitext(file)[1]
-            if ext in SUPPORTED_EXTENSIONS:
-                filepath = os.path.join(root, file)
-                try:
-                    with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
-                        content = f.read()
-                    relative_path = os.path.relpath(filepath, repo_path)
-                    docs.append(Document(
-                        page_content=content,
-                        metadata={"source": relative_path}
-                    ))
-                except Exception:
-                    continue
-    return docs
+# =========================
 
-def build_vectorstore(docs):
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1000,
-        chunk_overlap=200
+st.set_page_config(
+page_title="PDF RAG Chatbot",
+page_icon="📄",
+layout="wide"
+)
+
+st.title("📄 Conversational PDF RAG")
+st.markdown("Upload PDF files and chat with your documents.")
+
+# =========================
+
+# SESSION STATE
+
+# =========================
+
+if "store" not in st.session_state:
+st.session_state.store = {}
+
+if "messages" not in st.session_state:
+st.session_state.messages = []
+
+# =========================
+
+# API KEY
+
+# =========================
+
+groq_api_key = st.text_input(
+"Enter GROQ API Key",
+type="password"
+)
+
+if not groq_api_key:
+st.warning("Please enter your GROQ API Key")
+st.stop()
+
+# =========================
+
+# LLM
+
+# =========================
+
+llm = ChatGroq(
+groq_api_key=groq_api_key,
+model_name="llama-3.1-8b-instant",
+temperature=0
+)
+
+# =========================
+
+# EMBEDDINGS
+
+# =========================
+
+embeddings = HuggingFaceEmbeddings(
+model_name="sentence-transformers/all-MiniLM-L6-v2"
+)
+
+# =========================
+
+# SESSION ID
+
+# =========================
+
+session_id = st.text_input(
+"Session ID",
+value="default_session"
+)
+
+# =========================
+
+# FILE UPLOADER
+
+# =========================
+
+uploaded_files = st.file_uploader(
+"Upload PDF files",
+type="pdf",
+accept_multiple_files=True
+)
+
+# =========================
+
+# PROCESS PDFs
+
+# =========================
+
+if uploaded_files:
+
+```
+documents = []
+
+for uploaded_file in uploaded_files:
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as temp_file:
+        temp_file.write(uploaded_file.read())
+        temp_pdf_path = temp_file.name
+
+    loader = PyPDFLoader(temp_pdf_path)
+    docs = loader.load()
+
+    documents.extend(docs)
+
+# =========================
+# TEXT SPLITTING
+# =========================
+text_splitter = RecursiveCharacterTextSplitter(
+    chunk_size=1000,
+    chunk_overlap=200
+)
+
+splits = text_splitter.split_documents(documents)
+
+# =========================
+# VECTOR STORE
+# =========================
+vectorstore = Chroma.from_documents(
+    documents=splits,
+    embedding=embeddings
+)
+
+retriever = vectorstore.as_retriever(
+    search_kwargs={"k": 5}
+)
+
+# =========================
+# CONTEXTUALIZE QUESTION
+# =========================
+contextualize_q_system_prompt = (
+    "Given the chat history and latest user question, "
+    "formulate a standalone question that can be understood "
+    "without the chat history."
+)
+
+contextualize_q_prompt = ChatPromptTemplate.from_messages(
+    [
+        ("system", contextualize_q_system_prompt),
+        MessagesPlaceholder("chat_history"),
+        ("human", "{input}")
+    ]
+)
+
+history_aware_retriever = create_history_aware_retriever(
+    llm,
+    retriever,
+    contextualize_q_prompt
+)
+
+# =========================
+# QA SYSTEM PROMPT
+# =========================
+system_prompt = (
+    "You are an AI assistant for question-answering tasks. "
+    "Use the retrieved context to answer the question. "
+    "If you don't know the answer, say you don't know. "
+    "Keep answers concise and accurate.\n\n"
+    "{context}"
+)
+
+qa_prompt = ChatPromptTemplate.from_messages(
+    [
+        ("system", system_prompt),
+        MessagesPlaceholder("chat_history"),
+        ("human", "{input}")
+    ]
+)
+
+# =========================
+# QA CHAIN
+# =========================
+question_answer_chain = create_stuff_documents_chain(
+    llm,
+    qa_prompt
+)
+
+rag_chain = create_retrieval_chain(
+    history_aware_retriever,
+    question_answer_chain
+)
+
+# =========================
+# SESSION HISTORY
+# =========================
+def get_session_history(session: str) -> BaseChatMessageHistory:
+
+    if session not in st.session_state.store:
+        st.session_state.store[session] = ChatMessageHistory()
+
+    return st.session_state.store[session]
+
+# =========================
+# CONVERSATIONAL RAG
+# =========================
+conversational_rag_chain = RunnableWithMessageHistory(
+    rag_chain,
+    get_session_history,
+    input_messages_key="input",
+    history_messages_key="chat_history",
+    output_messages_key="answer"
+)
+
+# =========================
+# CHAT INPUT
+# =========================
+user_input = st.chat_input(
+    "Ask a question about your PDF..."
+)
+
+if user_input:
+
+    # Store user message
+    st.session_state.messages.append(
+        ("user", user_input)
     )
-    chunks = splitter.split_documents(docs)
-    embeddings = HuggingFaceEmbeddings(
-        model_name="sentence-transformers/all-MiniLM-L6-v2"
+
+    # Generate response
+    response = conversational_rag_chain.invoke(
+        {"input": user_input},
+        config={
+            "configurable": {
+                "session_id": session_id
+            }
+        }
     )
-    vectorstore = Chroma.from_documents(
-        documents=chunks,
-        embedding=embeddings,
-        persist_directory="./chroma_db"
+
+    answer = response["answer"]
+
+    # Store assistant response
+    st.session_state.messages.append(
+        ("assistant", answer)
     )
-    return vectorstore
 
-def build_qa_chain(retriever):
-    llm = ChatGroq(
-        model_name="llama-3.1-8b-instant",
-        temperature=0.2,
-        api_key=os.getenv("GROQ_API_KEY")
-    )
-    chain = ConversationalRetrievalChain.from_llm(
-        llm=llm,
-        retriever=retriever,
-        return_source_documents=True
-    )
-    return chain
+# =========================
+# DISPLAY CHAT
+# =========================
+for role, message in st.session_state.messages:
 
-
-st.set_page_config(page_title="GitHub Q&A Bot", page_icon="🤖")
-st.title("GitHub Repository Q&A Bot")
-
-repo_url = st.text_input("Paste a GitHub repo URL", placeholder="https://github.com/user/repo")
-
-if "chat_history" not in st.session_state:
-    st.session_state.chat_history = []
-if "qa_chain" not in st.session_state:
-    st.session_state.qa_chain = None
-
-if st.button("Ingest Repository") and repo_url:
-    with st.spinner("Cloning and processing repo..."):
-        shutil.rmtree("./cloned_repo", ignore_errors=True)
-        shutil.rmtree("./chroma_db", ignore_errors=True)
-
-        path = clone_repo(repo_url)
-        docs = load_code_files(path)
-        st.info(f"Loaded {len(docs)} files")
-
-        vectorstore = build_vectorstore(docs)
-        retriever = vectorstore.as_retriever(search_kwargs={"k": 5})
-
-        st.session_state.qa_chain = build_qa_chain(retriever)
-        st.success("Repository ingested! Ask your questions below.")
-
-if st.session_state.qa_chain:
-    question = st.chat_input("Ask something about this codebase...")
-    if question:
-        result = st.session_state.qa_chain({
-            "question": question,
-            "chat_history": st.session_state.chat_history
-        })
-        answer = result["answer"]
-        sources = list(set([
-            doc.metadata["source"] for doc in result["source_documents"]
-        ]))
-
-        st.session_state.chat_history.append((question, answer))
-
-        for q, a in st.session_state.chat_history:
-            with st.chat_message("user"):
-                st.write(q)
-            with st.chat_message("assistant"):
-                st.write(a)
-        st.caption("Sources: " + ", ".join(sources))
-        
-        
+    with st.chat_message(role):
+        st.write(message)
+```
