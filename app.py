@@ -129,7 +129,6 @@ accept_multiple_files=True
 
 if uploaded_files:
 
-```
 documents = []
 
 for uploaded_file in uploaded_files:
@@ -279,4 +278,3 @@ for role, message in st.session_state.messages:
 
     with st.chat_message(role):
         st.write(message)
-```
